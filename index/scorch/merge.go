@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,20 +46,8 @@ const mergePlanFuncKey = "mergePlanFunc"
 type mergePlanFunc func(*IndexSnapshot) (*mergeplan.MergePlan, error)
 
 func (s *Scorch) mergerLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			s.fireAsyncError(NewScorchError(
-				merger,
-				fmt.Sprintf("panic: %v, path: %s", r, s.path),
-				ErrAsyncPanic,
-			))
-		}
+	defer s.asyncTasks.Done()
 
-		s.asyncTasks.Done()
-	}()
-
-	var lastEpochMergePlanned uint64
-	var ctrlMsg *mergerCtrl
 	mergePlannerOptions, err := s.parseMergePlannerOptions()
 	if err != nil {
 		s.fireAsyncError(NewScorchError(
@@ -68,6 +57,43 @@ func (s *Scorch) mergerLoop() {
 		))
 		return
 	}
+
+	const maxRestarts = 3
+	restarts := 0
+	for {
+		exited := s.mergerLoopInner(mergePlannerOptions)
+		if exited {
+			return // clean shutdown via closeCh
+		}
+		// mergerLoopInner returned due to panic
+		restarts++
+		if restarts >= maxRestarts {
+			s.fireAsyncError(NewScorchError(
+				merger,
+				fmt.Sprintf("giving up after %d panics, path: %s", restarts, s.path),
+				ErrAsyncPanic,
+			))
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func (s *Scorch) mergerLoopInner(mergePlannerOptions *mergeplan.MergePlanOptions) (cleanExit bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 16384)
+			n := runtime.Stack(buf, false)
+			s.fireAsyncError(NewScorchError(
+				merger,
+				fmt.Sprintf("panic: %v, path: %s\n%s", r, s.path, buf[:n]),
+				ErrAsyncPanic,
+			))
+		}
+	}()
+
+	var lastEpochMergePlanned uint64
+	var ctrlMsg *mergerCtrl
 	ctrlMsgDflt := &mergerCtrl{ctx: context.Background(),
 		options: mergePlannerOptions,
 		doneCh:  nil}
@@ -78,7 +104,7 @@ OUTER:
 
 		select {
 		case <-s.closeCh:
-			break OUTER
+			cleanExit = true; return
 
 		default:
 			// check to see if there is a new snapshot to persist
@@ -126,7 +152,7 @@ OUTER:
 
 						// exit the workloop on index closure
 						ctrlMsg = nil
-						break OUTER
+						cleanExit = true; return
 					}
 
 					s.fireAsyncError(NewScorchError(
@@ -162,7 +188,7 @@ OUTER:
 			// give it to the persister
 			select {
 			case <-s.closeCh:
-				break OUTER
+				cleanExit = true; return
 			case s.persisterNotifier <- ew:
 			case ctrlMsg = <-s.forceMergeRequestCh:
 				continue OUTER
@@ -171,7 +197,7 @@ OUTER:
 			// now wait for persister (but also detect close)
 			select {
 			case <-s.closeCh:
-				break OUTER
+				cleanExit = true; return
 			case <-ew.notifyCh:
 			case ctrlMsg = <-s.forceMergeRequestCh:
 			}
