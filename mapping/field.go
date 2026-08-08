@@ -105,6 +105,7 @@ func newTextFieldMappingDynamic(im *IndexMappingImpl) *FieldMapping {
 	rv.Store = im.StoreDynamic
 	rv.Index = im.IndexDynamic
 	rv.DocValues = im.DocValuesDynamic
+	rv.IncludeTermVectors = false // KOSMOS: dynamic fields don't need positions
 	return rv
 }
 
