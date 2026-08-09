@@ -93,6 +93,8 @@ type Scorch struct {
 	segPlugin SegmentPlugin
 
 	spatialPlugin index.SpatialAnalyzerPlugin
+
+	heavyDebug bool // when true, verify all segments after every write/merge
 }
 
 // trainer interface is used for training an index that has the concept

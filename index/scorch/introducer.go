@@ -16,6 +16,7 @@ package scorch
 
 import (
 	"fmt"
+	"log"
 	"path/filepath"
 	"sync/atomic"
 
@@ -254,6 +255,14 @@ func (s *Scorch) introduceSegment(next *segmentIntroduction) error {
 		_ = rootPrev.DecRef()
 	}
 
+	// heavy debug: log what was introduced, then verify all segments
+	if scorchHeavyDebug || s.heavyDebug {
+		log.Printf("scorch: INTRODUCE seg=%d docs=%d ids=%d trigger=introduceSegment",
+			next.id, func() uint64 { if next.data != nil { return next.data.Count() }; return 0 }(),
+			len(next.ids))
+	}
+	s.verifyCurrentRoot("introduceSegment")
+
 	// update the removal eligibility for those segment files
 	// that are not a part of the latest root.
 	for _, filename := range droppedSegmentFiles {
@@ -340,6 +349,16 @@ func (s *Scorch) introducePersist(persist *persistIntroduction) {
 	if rootPrev != nil {
 		_ = rootPrev.DecRef()
 	}
+
+	// heavy debug: log what was persisted, then verify all segments
+	if scorchHeavyDebug || s.heavyDebug {
+		persisted := make([]uint64, 0, len(persist.persisted))
+		for id := range persist.persisted {
+			persisted = append(persisted, id)
+		}
+		log.Printf("scorch: INTRODUCE persisted=%v trigger=introducePersist", persisted)
+	}
+	s.verifyCurrentRoot("introducePersist")
 
 	close(persist.applied)
 }
@@ -504,6 +523,24 @@ func (s *Scorch) introduceMerge(nextMerge *segmentMerge) {
 	if rootPrev != nil {
 		_ = rootPrev.DecRef()
 	}
+
+	// heavy debug: log what was merged, then verify all segments
+	if scorchHeavyDebug || s.heavyDebug {
+		mergedIDs := make([]uint64, 0)
+		for id := range nextMerge.mergedSegHistory {
+			mergedIDs = append(mergedIDs, id)
+		}
+		newIDs := nextMerge.id
+		var newCount uint64
+		for _, seg := range nextMerge.new {
+			if seg != nil {
+				newCount += seg.Count()
+			}
+		}
+		log.Printf("scorch: INTRODUCE merge old=%v new=%v docs=%d skipped=%v trigger=introduceMerge",
+			mergedIDs, newIDs, newCount, skipped)
+	}
+	s.verifyCurrentRoot("introduceMerge")
 
 	// update the removal eligibility for those segment files
 	// that are not a part of the latest root.
