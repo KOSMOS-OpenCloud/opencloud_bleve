@@ -94,7 +94,7 @@ type Scorch struct {
 
 	spatialPlugin index.SpatialAnalyzerPlugin
 
-	heavyDebug bool // when true, verify all segments after every write/merge
+	// debug level is controlled via SCORCH_DEBUG env (off/smart/full), see verify.go
 }
 
 // trainer interface is used for training an index that has the concept

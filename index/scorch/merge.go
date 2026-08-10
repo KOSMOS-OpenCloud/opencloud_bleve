@@ -17,6 +17,7 @@ package scorch
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"strings"
@@ -428,10 +429,31 @@ func (s *Scorch) planMergeAtSnapshot(ctrlMsg *mergerCtrl, ourSnapshot *IndexSnap
 
 			atomic.AddUint64(&s.stats.TotFileMergeZapBeg, 1)
 			prevBytesReadTotal := cumulateBytesRead(segmentsToMerge)
+
+			// smart debug: clone drop bitmaps + capture cardinalities before merge
+			mergeDrops := docsToDrop
+			var dropCardsBefore []uint64
+			var mergeSegIDs []uint64
+			if isDebugSmart() {
+				mergeDrops = cloneDropBitmaps(docsToDrop)
+				dropCardsBefore = captureDropCardinalities(docsToDrop)
+				for _, ss := range task.Segments {
+					mergeSegIDs = append(mergeSegIDs, ss.Id())
+				}
+				log.Printf("scorch: MERGE START file segs=%v drops=%v path=%s",
+					mergeSegIDs, dropCardsBefore, filename)
+			}
+
 			var newDocNums [][]uint64
-			newDocNums, _, err = s.segPlugin.MergeUsing(segmentsToMerge, docsToDrop, path,
+			newDocNums, _, err = s.segPlugin.MergeUsing(segmentsToMerge, mergeDrops, path,
 				cw.cancelCh, s, s.segmentConfig)
 			atomic.AddUint64(&s.stats.TotFileMergeZapEnd, 1)
+
+			// smart debug: check bitmap stability + verify result segment
+			if isDebugSmart() {
+				dropCardsAfter := captureDropCardinalities(docsToDrop)
+				checkDropBitmapStability("fileMerge", mergeSegIDs, dropCardsBefore, dropCardsAfter)
+			}
 
 			fileMergeZapTime := uint64(time.Since(fileMergeZapStartTime))
 			atomic.AddUint64(&s.stats.TotFileMergeZapTime, fileMergeZapTime)
@@ -453,6 +475,19 @@ func (s *Scorch) planMergeAtSnapshot(ctrlMsg *mergerCtrl, ourSnapshot *IndexSnap
 				s.unmarkIneligibleForRemoval(filename)
 				atomic.AddUint64(&s.stats.TotFileMergePlanTasksErr, 1)
 				return err
+			}
+
+			// smart debug: verify the newly created merge result segment
+			if isDebugSmart() {
+				if verr := verifySegment(seg, nil, fmt.Sprintf("fileMerge-result-%s", filename)); verr != nil {
+					log.Printf("scorch: MERGE RESULT CORRUPT [fileMerge] %s: %v", filename, verr)
+					// guarded mode: discard corrupt result, keep source segments
+					seg.Close()
+					os.Remove(path)
+					s.unmarkIneligibleForRemoval(filename)
+					return fmt.Errorf("merge result corrupt, discarded: %v", verr)
+				}
+				log.Printf("scorch: MERGE RESULT OK [fileMerge] %s docs=%d", filename, seg.Count())
 			}
 
 			totalBytesRead := seg.BytesRead() + prevBytesReadTotal
@@ -595,10 +630,25 @@ func (s *Scorch) mergeAndPersistInMemorySegments(snapshot *IndexSnapshot,
 			filename := zapFileName(newSegmentID)
 			path := s.path + string(os.PathSeparator) + filename
 
-			// the newly merged segment is already flushed out to disk, just needs
-			// to be opened using mmap.
+			// smart debug: clone drops + capture cardinalities
+			mergeDrops := dropsBatch
+			var dropCardsBefore []uint64
+			if isDebugSmart() {
+				mergeDrops = cloneDropBitmaps(dropsBatch)
+				dropCardsBefore = captureDropCardinalities(dropsBatch)
+				log.Printf("scorch: MERGE START memMerge worker=%d segs=%d drops=%v path=%s",
+					id, len(segsBatch), dropCardsBefore, filename)
+			}
+
 			newDocIDs, _, err :=
-				s.segPlugin.MergeUsing(segsBatch, dropsBatch, path, s.closeCh, s, s.segmentConfig)
+				s.segPlugin.MergeUsing(segsBatch, mergeDrops, path, s.closeCh, s, s.segmentConfig)
+
+			// smart debug: check bitmap stability
+			if isDebugSmart() {
+				dropCardsAfter := captureDropCardinalities(dropsBatch)
+				checkDropBitmapStability("memMerge", nil, dropCardsBefore, dropCardsAfter)
+			}
+
 			if err != nil {
 				em.Lock()
 				errs = append(errs, err)
@@ -606,10 +656,6 @@ func (s *Scorch) mergeAndPersistInMemorySegments(snapshot *IndexSnapshot,
 				atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
 				return
 			}
-			// to prevent accidental cleanup of this newly created file, mark it
-			// as ineligible for removal. this will be flipped back when the bolt
-			// is updated - which is valid, since the snapshot updated in bolt is
-			// cleaned up only if its zero ref'd (MB-66163 for more details)
 			s.markIneligibleForRemoval(filename)
 			newMergedSegmentIDs[id] = newSegmentID
 			newDocIDsSet[id] = newDocIDs
@@ -621,6 +667,16 @@ func (s *Scorch) mergeAndPersistInMemorySegments(snapshot *IndexSnapshot,
 				atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
 				return
 			}
+
+			// smart debug: verify the newly created merge result
+			if isDebugSmart() {
+				if verr := verifySegment(newMergedSegments[id], nil, fmt.Sprintf("memMerge-result-%s", filename)); verr != nil {
+					log.Printf("scorch: MERGE RESULT CORRUPT [memMerge] %s: %v", filename, verr)
+				} else {
+					log.Printf("scorch: MERGE RESULT OK [memMerge] %s docs=%d", filename, newMergedSegments[id].Count())
+				}
+			}
+
 			atomic.AddUint64(&newMergedCount, newMergedSegments[id].Count())
 			atomic.AddUint64(&numSegments, uint64(len(segsBatch)))
 		}(flushableObjs[i].segments, flushableObjs[i].drops, i)

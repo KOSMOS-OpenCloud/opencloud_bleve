@@ -5,23 +5,79 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"github.com/RoaringBitmap/roaring/v2"
+	segment "github.com/blevesearch/scorch_segment_api/v2"
 )
 
+// debugLevel controls the verification intensity.
+//   "off"   = no verification (default)
+//   "smart" = verify only merge results + count bitmap cardinality before/after
+//   "full"  = verify all segments after every introduction
+var debugLevel string
+
 func init() {
-	if os.Getenv("SCORCH_HEAVY_DEBUG") == "true" {
-		scorchHeavyDebug = true
-		log.Printf("scorch: HEAVY_DEBUG enabled — verifying all segments after every introduction")
+	debugLevel = os.Getenv("SCORCH_DEBUG")
+	if debugLevel == "" || debugLevel == "false" || debugLevel == "off" {
+		debugLevel = "off"
+	}
+	// backwards compat: "true" = "full" (old SCORCH_HEAVY_DEBUG)
+	if debugLevel == "true" {
+		debugLevel = "full"
+	}
+	if debugLevel != "off" {
+		log.Printf("scorch: DEBUG level=%s", debugLevel)
 	}
 }
 
-var scorchHeavyDebug bool
+func isDebugSmart() bool { return debugLevel == "smart" || debugLevel == "full" }
+func isDebugFull() bool  { return debugLevel == "full" }
+
+// verifySegment reads every posting of every term of every field in a single
+// segment. Returns nil if readable, or the first error found.
+func verifySegment(seg segment.Segment, deleted *roaring.Bitmap, label string) error {
+	fields := seg.Fields()
+	for _, field := range fields {
+		dict, err := seg.Dictionary(field)
+		if err != nil {
+			return fmt.Errorf("[%s] field=%s: Dictionary(): %v", label, field, err)
+		}
+		dictItr := dict.AutomatonIterator(nil, nil, nil)
+		for {
+			entry, err := dictItr.Next()
+			if err != nil {
+				return fmt.Errorf("[%s] field=%s: dictItr: %v", label, field, err)
+			}
+			if entry == nil {
+				break
+			}
+			pl, err := dict.PostingsList([]byte(entry.Term), deleted, nil)
+			if err != nil {
+				return fmt.Errorf("[%s] field=%s term=%q: PostingsList: %v",
+					label, field, truncTerm(entry.Term), err)
+			}
+			itr := pl.Iterator(true, true, true, nil)
+			count := 0
+			for {
+				p, err := itr.Next()
+				if err != nil {
+					return fmt.Errorf("[%s] field=%s term=%q posting=%d: Iterator: %v",
+						label, field, truncTerm(entry.Term), count, err)
+				}
+				if p == nil {
+					break
+				}
+				count++
+			}
+		}
+	}
+	return nil
+}
 
 // verifySnapshot reads every posting of every term of every field in every
-// segment of the snapshot. If any ReadUvarint or other error occurs, it logs
-// the exact location (segment, field, term, posting count) and returns the error.
-// This is extremely expensive and should only be enabled for debugging.
+// segment of the snapshot. Logs exact location of any error.
 func (s *Scorch) verifySnapshot(snapshot *IndexSnapshot, trigger string) {
-	if !scorchHeavyDebug && !s.heavyDebug {
+	if !isDebugFull() {
 		return
 	}
 
@@ -85,7 +141,6 @@ func (s *Scorch) verifySnapshot(snapshot *IndexSnapshot, trigger string) {
 					totalPostings++
 				}
 			}
-			// dictItr has no Close()
 		}
 	}
 
@@ -108,7 +163,7 @@ func truncTerm(t string) string {
 
 // verifyCurrentRoot verifies the current root snapshot (acquires rootLock briefly).
 func (s *Scorch) verifyCurrentRoot(trigger string) {
-	if !scorchHeavyDebug && !s.heavyDebug {
+	if !isDebugFull() {
 		return
 	}
 
@@ -127,8 +182,42 @@ func (s *Scorch) verifyCurrentRoot(trigger string) {
 	s.verifySnapshot(root, trigger)
 }
 
+// cloneDropBitmaps returns deep copies of the drop bitmaps to prevent
+// mutation during merge. This is the candidate fix for MB-70770.
+func cloneDropBitmaps(drops []*roaring.Bitmap) []*roaring.Bitmap {
+	cloned := make([]*roaring.Bitmap, len(drops))
+	for i, bm := range drops {
+		if bm != nil {
+			cloned[i] = bm.Clone()
+		}
+	}
+	return cloned
+}
+
+// checkDropBitmapStability compares drop bitmap cardinalities before and after
+// a merge. If any changed, the bitmap was mutated during the merge — confirming
+// the race condition.
+func checkDropBitmapStability(label string, segIDs []uint64, before, after []uint64) {
+	for i := range before {
+		if before[i] != after[i] {
+			log.Printf("scorch: DROP BITMAP CHANGED [%s] segment=%d: before=%d after=%d (delta=%d)",
+				label, segIDs[i], before[i], after[i], int64(after[i])-int64(before[i]))
+		}
+	}
+}
+
+// captureDropCardinalities records the cardinality of each drop bitmap.
+func captureDropCardinalities(drops []*roaring.Bitmap) []uint64 {
+	cards := make([]uint64, len(drops))
+	for i, bm := range drops {
+		if bm != nil {
+			cards[i] = bm.GetCardinality()
+		}
+	}
+	return cards
+}
+
 // VerifyIndex is a public API to verify the current index state.
-// Returns nil if all segments are readable, or an error describing the first problem.
 func (s *Scorch) VerifyIndex() error {
 	s.rootLock.RLock()
 	root := s.root
@@ -143,43 +232,8 @@ func (s *Scorch) VerifyIndex() error {
 	defer func() { _ = root.DecRef() }()
 
 	for segIdx, segSnap := range root.segment {
-		fields := segSnap.segment.Fields()
-		if len(fields) == 0 {
-			continue
-		}
-		for _, field := range fields {
-			dict, err := segSnap.segment.Dictionary(field)
-			if err != nil {
-				return fmt.Errorf("seg %d field %s: Dictionary(): %v", segIdx, field, err)
-			}
-			dictItr := dict.AutomatonIterator(nil, nil, nil)
-			for {
-				entry, err := dictItr.Next()
-				if err != nil {
-					// dictItr has no Close()
-					return fmt.Errorf("seg %d field %s: dictItr: %v", segIdx, field, err)
-				}
-				if entry == nil {
-					break
-				}
-				pl, err := dict.PostingsList([]byte(entry.Term), segSnap.deleted, nil)
-				if err != nil {
-					// dictItr has no Close()
-					return fmt.Errorf("seg %d field %s term %q: PostingsList: %v", segIdx, field, truncTerm(entry.Term), err)
-				}
-				itr := pl.Iterator(true, true, true, nil)
-				for {
-					p, err := itr.Next()
-					if err != nil {
-						// dictItr has no Close()
-						return fmt.Errorf("seg %d field %s term %q: Iterator: %v", segIdx, field, truncTerm(entry.Term), err)
-					}
-					if p == nil {
-						break
-					}
-				}
-			}
-			// dictItr has no Close()
+		if err := verifySegment(segSnap.segment, segSnap.deleted, fmt.Sprintf("seg%d", segIdx)); err != nil {
+			return err
 		}
 	}
 	return nil

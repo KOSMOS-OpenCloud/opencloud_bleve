@@ -256,7 +256,7 @@ func (s *Scorch) introduceSegment(next *segmentIntroduction) error {
 	}
 
 	// heavy debug: log what was introduced, then verify all segments
-	if scorchHeavyDebug || s.heavyDebug {
+	if isDebugFull() {
 		log.Printf("scorch: INTRODUCE seg=%d docs=%d ids=%d trigger=introduceSegment",
 			next.id, func() uint64 { if next.data != nil { return next.data.Count() }; return 0 }(),
 			len(next.ids))
@@ -351,7 +351,7 @@ func (s *Scorch) introducePersist(persist *persistIntroduction) {
 	}
 
 	// heavy debug: log what was persisted, then verify all segments
-	if scorchHeavyDebug || s.heavyDebug {
+	if isDebugFull() {
 		persisted := make([]uint64, 0, len(persist.persisted))
 		for id := range persist.persisted {
 			persisted = append(persisted, id)
@@ -525,7 +525,7 @@ func (s *Scorch) introduceMerge(nextMerge *segmentMerge) {
 	}
 
 	// heavy debug: log what was merged, then verify all segments
-	if scorchHeavyDebug || s.heavyDebug {
+	if isDebugFull() {
 		mergedIDs := make([]uint64, 0)
 		for id := range nextMerge.mergedSegHistory {
 			mergedIDs = append(mergedIDs, id)
