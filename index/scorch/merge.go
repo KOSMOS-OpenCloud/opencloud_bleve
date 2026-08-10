@@ -480,26 +480,36 @@ func (s *Scorch) planMergeAtSnapshot(ctrlMsg *mergerCtrl, ourSnapshot *IndexSnap
 			// smart debug: verify the newly created merge result segment
 			if isDebugSmart() {
 				if verr := verifySegment(seg, nil, fmt.Sprintf("fileMerge-result-%s", filename)); verr != nil {
-					log.Printf("scorch: MERGE RESULT CORRUPT [fileMerge] %s: %v", filename, verr)
+					log.Printf("scorch: MERGE RESULT CORRUPT [fileMerge] %s: %v — discarded, will retry", filename, verr)
 					// guarded mode: discard corrupt result, keep source segments
+					// NOT an error — the merger should continue with the next plan cycle
 					seg.Close()
+					seg = nil
 					os.Remove(path)
 					s.unmarkIneligibleForRemoval(filename)
-					return fmt.Errorf("merge result corrupt, discarded: %v", verr)
-				}
-				log.Printf("scorch: MERGE RESULT OK [fileMerge] %s docs=%d", filename, seg.Count())
-			}
-
-			totalBytesRead := seg.BytesRead() + prevBytesReadTotal
-			seg.ResetBytesRead(totalBytesRead)
-
-			for i, segNewDocNums := range newDocNums {
-				if mergedSegHistory[task.Segments[i].Id()] != nil {
-					mergedSegHistory[task.Segments[i].Id()].oldNewDocIDs = segNewDocNums
+					atomic.AddUint64(&s.stats.TotFileMergePlanTasksErr, 1)
+				} else {
+					log.Printf("scorch: MERGE RESULT OK [fileMerge] %s docs=%d", filename, seg.Count())
 				}
 			}
 
-			atomic.AddUint64(&s.stats.TotFileMergeSegments, uint64(len(segmentsToMerge)))
+			if seg != nil {
+				totalBytesRead := seg.BytesRead() + prevBytesReadTotal
+				seg.ResetBytesRead(totalBytesRead)
+
+				for i, segNewDocNums := range newDocNums {
+					if mergedSegHistory[task.Segments[i].Id()] != nil {
+						mergedSegHistory[task.Segments[i].Id()].oldNewDocIDs = segNewDocNums
+					}
+				}
+
+				atomic.AddUint64(&s.stats.TotFileMergeSegments, uint64(len(segmentsToMerge)))
+			}
+		}
+
+		// skip introduction if merge result was discarded (guarded mode)
+		if seg == nil {
+			continue
 		}
 
 		sm := &segmentMerge{
@@ -671,10 +681,15 @@ func (s *Scorch) mergeAndPersistInMemorySegments(snapshot *IndexSnapshot,
 			// smart debug: verify the newly created merge result
 			if isDebugSmart() {
 				if verr := verifySegment(newMergedSegments[id], nil, fmt.Sprintf("memMerge-result-%s", filename)); verr != nil {
-					log.Printf("scorch: MERGE RESULT CORRUPT [memMerge] %s: %v", filename, verr)
-				} else {
-					log.Printf("scorch: MERGE RESULT OK [memMerge] %s docs=%d", filename, newMergedSegments[id].Count())
+					log.Printf("scorch: MERGE RESULT CORRUPT [memMerge] %s: %v — discarded, will retry", filename, verr)
+					newMergedSegments[id].Close()
+					newMergedSegments[id] = nil
+					os.Remove(path)
+					s.unmarkIneligibleForRemoval(filename)
+					atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
+					return
 				}
+				log.Printf("scorch: MERGE RESULT OK [memMerge] %s docs=%d", filename, newMergedSegments[id].Count())
 			}
 
 			atomic.AddUint64(&newMergedCount, newMergedSegments[id].Count())
