@@ -866,6 +866,15 @@ func (s *Scorch) persistSnapshotDirect(snapshot *IndexSnapshot, exclude map[uint
 			if err != nil {
 				return fmt.Errorf("error opening new segment at %s, %v", path, err)
 			}
+
+			if isDebugSmart() {
+				if verr := verifySegment(newSegments[segmentID], nil, fmt.Sprintf("persistDirect-%012x", segmentID)); verr != nil {
+					log.Printf("scorch: PERSIST DIRECT CORRUPT %012x: %v — discarding segment", segmentID, verr)
+					_ = newSegments[segmentID].Close()
+					delete(newSegments, segmentID)
+					_ = os.Remove(path)
+				}
+			}
 		}
 
 		persist := &persistIntroduction{
